@@ -116,6 +116,20 @@ class FileDiff(BaseModel):
     hunk_ids: list[str] = Field(default_factory=list)
 
 
+ArchKind = Literal["coupling", "layering", "duplication", "api", "data", "consistency", "extensibility", "other"]
+
+
+class ArchNote(BaseModel):
+    """One architectural consideration raised by the review: how the change
+    fits or strains the surrounding design. Produced with the flow stage."""
+
+    id: str  # A1, A2, ...
+    kind: ArchKind = "other"
+    title: str
+    note: str = ""
+    anchors: list[Anchor] = Field(default_factory=list)
+
+
 class FlowNode(BaseModel):
     """A changed symbol in the change-flow diagram (DESIGN.md §7.2)."""
 
@@ -191,6 +205,7 @@ class Review(BaseModel):
     links: list[Link] = Field(default_factory=list)
     unexplained: list[UnexplainedChange] = Field(default_factory=list)
     net_effect: list[str] = Field(default_factory=list)
+    architecture: list[ArchNote] = Field(default_factory=list)
     files: list[FileDiff] = Field(default_factory=list)
     sources: list[SourceText] = Field(default_factory=list)
     bugs: list[BugFinding] = Field(default_factory=list)

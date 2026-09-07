@@ -15,8 +15,8 @@ from .config import save_review
 from .diff_parser import parse_diff
 from .llm.base import LLMBackend
 from .models import (
-    Anchor, FlowEdge, FlowGraph, FlowNode, Hunk, Link, PRContent, Requirement,
-    Review, SourceText, TicketContent, TicketRef, UnexplainedChange, review_id,
+    Anchor, ArchNote, FileDiff, FlowEdge, FlowGraph, FlowNode, Hunk, Link, PRContent,
+    Requirement, Review, SourceText, TicketContent, TicketRef, UnexplainedChange, review_id,
 )
 from .providers.base import PRProvider
 from .tickets import RequirementsSource, detect_ticket_refs
@@ -405,8 +405,22 @@ FLOW_SCHEMA: dict[str, Any] = {
             },
         },
         "summary": {"type": "array", "items": {"type": "string"}},
+        "architecture": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["coupling", "layering", "duplication", "api",
+                                                        "data", "consistency", "extensibility", "other"]},
+                    "title": {"type": "string"},
+                    "note": {"type": "string"},
+                    "anchors": {"type": "array", "items": _ANCHOR_SCHEMA},
+                },
+                "required": ["kind", "title", "note", "anchors"],
+            },
+        },
     },
-    "required": ["nodes", "edges", "summary"],
+    "required": ["nodes", "edges", "summary", "architecture"],
 }
 
 FLOW_PROMPT = """You are building a change-flow diagram for a PR review: the interaction graph of the symbols this PR touches. Topology only — layout is computed elsewhere.
@@ -416,13 +430,64 @@ Hard constraints:
 - edges: interactions introduced or modified by this PR between those nodes — calls, reads, writes, emits. label: max 4 words ("gate login", "append stamp"). requirement_ids: which item ids below the interaction serves (empty list if none). missing=false.
 - missing edges: for each partial item whose gap is an absent interaction between two emitted nodes, add ONE edge with missing=true from the node that should act to the target, label naming the absent interaction ("missing call"). Never invent missing edges for gaps that are not interactions.
 - summary: 2-4 bullet-length lines explaining how this flow fulfills (or fails) the items — reference item ids (R1) and node labels; terse fragments, no prose. Example: "R1: login() gates on check_lockout() before verify, so a 6th attempt is rejected."
+- architecture: 0-5 architectural considerations — how this change fits or strains the surrounding design, judged from the file inventory and hunks. kind: coupling (new dependency between modules/layers), layering (logic in the wrong layer, e.g. business rules in a handler), duplication (re-implements something that plausibly exists), api (public surface/contract change, compatibility), data (schema/state shape, migration, persistence), consistency (departs from the pattern neighbouring code uses), extensibility (hard-codes what will need to vary / or generalises well), other. title: terse noun phrase (max ~10 words). note: ONE sentence — the concrete observation and why it matters to a maintainer; name symbols/files. anchors: new-file line ranges inside the hunks below where the consideration is visible (may be empty for inventory-level observations). Raise only what a senior engineer would actually say in review — no generic advice, no restating findings about correctness. Positive observations are allowed when notable ("consolidates three auth checks into one gate"). Empty list is a fine answer.
 
 Items ({mode_label}):
 {items_block}
 
+Files in this PR (path — status — lines added/removed):
+{files_block}
+
 Diff hunks (id — file — new-file line range):
 {hunks_block}
-{feedback_block}"""
+{feedback_block}{instructions_block}"""
+
+
+def _files_block(files: list[FileDiff]) -> str:
+    """Whole-PR footprint for the architecture view — cheap even when the
+    hunks themselves are chunked and only partly shown."""
+    out = []
+    for f in files[:80]:
+        added = sum(1 for r in f.rows if r.n and (not r.o or r.o[1] != r.n[1]))
+        removed = sum(1 for r in f.rows if r.o and (not r.n or r.o[1] != r.n[1]))
+        out.append(f"{f.path} — {f.status} — +{added}/-{removed}")
+    if len(files) > 80:
+        out.append(f"… and {len(files) - 80} more files")
+    return "\n".join(out) or "(none)"
+
+
+_ARCH_KINDS = {"coupling", "layering", "duplication", "api", "data", "consistency", "extensibility", "other"}
+
+
+def validate_architecture(raw: dict[str, Any], hunks: list[Hunk]) -> list[ArchNote]:
+    """Keep well-formed considerations; anchors outside hunks are dropped from
+    the note (never fatal — an inventory-level observation needs no anchor)."""
+    by_file: dict[str, list[Hunk]] = {}
+    for h in hunks:
+        by_file.setdefault(h.file, []).append(h)
+    notes: list[ArchNote] = []
+    for item in raw.get("architecture", []) or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        if not title:
+            continue
+        kind = str(item.get("kind", "other")).strip().lower()
+        if kind not in _ARCH_KINDS:
+            kind = "other"
+        anchors: list[Anchor] = []
+        for a in item.get("anchors", []) or []:
+            try:
+                file, start, end = str(a["file"]), int(a["start"]), int(a["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if start > end:
+                start, end = end, start
+            if any(h.start <= start and end <= h.end for h in by_file.get(file, [])):
+                anchors.append(Anchor(file=file, start=start, end=end))
+        notes.append(ArchNote(id=f"A{len(notes) + 1}", kind=kind, title=title[:80],
+                              note=str(item.get("note", "")).strip(), anchors=anchors))
+    return notes
 
 
 def validate_flow(
@@ -503,7 +568,9 @@ async def build_flow(
     mode_label: str,
     backend: LLMBackend,
     progress: ProgressCB = lambda stage, detail: None,
-) -> FlowGraph:
+    files: list[FileDiff] | None = None,
+    instructions: str = "",
+) -> tuple[FlowGraph, list[ArchNote]]:
     items_block = "\n".join(f"{i} [{s}]: {t}" for i, s, t in items)
     known_ids = {i for i, _, _ in items}
     # flow runs on at most one chunk's worth of hunks — huge PRs get a partial graph
@@ -512,19 +579,23 @@ async def build_flow(
     is_partial = len(all_chunks) > 1
     feedback = ""
     flow = FlowGraph()
+    architecture: list[ArchNote] = []
     for attempt in range(2):
-        progress("flow", f"Building change-flow diagram (LLM call 3{', retry' if attempt else ''})")
+        progress("flow", f"Building change-flow diagram + architecture notes (LLM call 3{', retry' if attempt else ''})")
         raw = await backend.structured(
             FLOW_PROMPT.format(mode_label=mode_label, items_block=items_block,
-                               hunks_block=_hunks_block(hunks), feedback_block=feedback),
+                               files_block=_files_block(files or []),
+                               hunks_block=_hunks_block(hunks), feedback_block=feedback,
+                               instructions_block=instructions_block(instructions)),
             FLOW_SCHEMA,
         )
         flow, errors = validate_flow(raw, review_hunks, known_ids)
+        architecture = validate_architecture(raw, review_hunks)
         if not errors:
             break
         feedback = "\nYour previous answer had invalid elements — fix them:\n- " + "\n- ".join(errors[:12])
     flow.partial = is_partial
-    return flow
+    return flow, architecture
 
 
 def add_ghost_nodes(flow: FlowGraph, requirements: list[Requirement], links: list[Link]) -> FlowGraph:
@@ -801,6 +872,7 @@ async def run_review(
 
     # FLOW (LLM #3) — change-flow diagram topology (optional: never fails the review)
     flow = FlowGraph()
+    architecture: list[ArchNote] = []
     if hunks:
         if mode == "requirements":
             items = [(r.id, next((l.status for l in links if l.requirement_id == r.id), "notfound"), r.text)
@@ -810,9 +882,10 @@ async def run_review(
             items = [(u.id, "explained", u.label) for u in unexplained]
             mode_label = "annotated changes"
         try:
-            flow = await build_flow(hunks, items, mode_label, backend, progress)
+            flow, architecture = await build_flow(hunks, items, mode_label, backend, progress,
+                                                  files=files, instructions=instructions)
         except Exception:
-            flow = FlowGraph()
+            flow, architecture = FlowGraph(), []
         if mode == "requirements":
             flow = add_ghost_nodes(flow, requirements, links)
 
@@ -829,6 +902,8 @@ async def run_review(
         overflow["net_effect"] = len(raw_net) - 6
     if flow.dropped:
         overflow["flow_nodes"] = flow.dropped
+    if len(architecture) > 6:
+        overflow["architecture"] = len(architecture) - 6
 
     review = Review(
         id=review_id(provider.name, repo, number),
@@ -842,6 +917,7 @@ async def run_review(
         links=links,
         unexplained=unexplained,
         net_effect=[l for l in raw_map.get("net_effect", [])][:6],
+        architecture=architecture[:6],
         files=files,
         flow=flow,
         created_at=datetime.now(timezone.utc).isoformat(),

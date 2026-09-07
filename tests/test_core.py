@@ -647,3 +647,82 @@ def test_linear_oauth_helpers():
     assert lin._auth() == "Bearer oat_x"
     cfg["linear"]["oauth_access_token"] = ""
     assert build_sources(cfg)["linear"]._auth() == "lin_api_SYNTHETIC"
+
+
+def test_validate_architecture_keeps_notes_drops_bad_anchors():
+    from pr_reviewer.pipeline import validate_architecture
+
+    raw = {"architecture": [
+        {"kind": "layering", "title": "Lockout policy lives in the login handler",
+         "note": "check_lockout() is called from the route, not the auth service.",
+         "anchors": [{"file": "auth/login.py", "start": 40, "end": 42},
+                     {"file": "auth/login.py", "start": 900, "end": 901},   # outside hunks
+                     {"file": "nope.py", "start": 1, "end": 1}]},          # unknown file
+        {"kind": "made-up", "title": "Inventory-level remark", "note": "", "anchors": []},
+        {"kind": "coupling", "title": "", "note": "dropped: no title", "anchors": []},
+        "not-a-dict",
+    ]}
+    notes = validate_architecture(raw, _hunks())
+    assert [n.id for n in notes] == ["A1", "A2"]
+    assert notes[0].kind == "layering" and len(notes[0].anchors) == 1
+    assert notes[0].anchors[0].start == 40
+    assert notes[1].kind == "other" and notes[1].anchors == []   # unknown kind normalised, anchorless ok
+
+
+def test_flow_schema_requires_architecture_and_review_defaults_empty():
+    from pr_reviewer.models import Review, PRInfo
+    from pr_reviewer.pipeline import FLOW_SCHEMA, _files_block
+    from pr_reviewer.models import FileDiff, DiffRow
+
+    assert "architecture" in FLOW_SCHEMA["required"]
+    files = [FileDiff(path="a.py", status="mod", rows=[
+        DiffRow(o=(1, "same"), n=(1, "same")),
+        DiffRow(o=(2, "old"), n=(2, "new")),
+        DiffRow(n=(3, "added")),
+        DiffRow(o=(3, "removed")),
+    ])]
+    assert _files_block(files) == "a.py — mod — +2/-2"
+    assert _files_block([]) == "(none)"
+
+
+def test_sections_migration_inserts_architecture_once():
+    from pr_reviewer.config import _migrate_sections
+
+    cr = {"sections": ["net_effect", "unexplained", "files"]}       # saved before v2
+    _migrate_sections(cr)
+    assert cr["sections"] == ["net_effect", "unexplained", "architecture", "files"]
+    assert cr["sections_v"] == 2
+    cr["sections"].remove("architecture")                              # user turns it off
+    _migrate_sections(cr)
+    assert "architecture" not in cr["sections"]                        # stays off
+
+
+def test_load_config_migrates_saved_sections(tmp_path, monkeypatch):
+    import json
+    from pr_reviewer import config
+
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"custom_review": {
+        "instructions": "", "findings_group_by": "severity",
+        "sections": ["net_effect", "requirements", "unexplained", "findings", "files"],
+    }}))
+    monkeypatch.setattr(config, "CONFIG_PATH", path)
+    cr = config.load_config()["custom_review"]
+    assert cr["sections"] == ["net_effect", "requirements", "unexplained", "architecture", "findings", "files"]
+    assert cr["sections_v"] == 2
+    # a fresh install (no file) already has the section and the current version
+    monkeypatch.setattr(config, "CONFIG_PATH", tmp_path / "missing.json")
+    fresh = config.load_config()["custom_review"]
+    assert "architecture" in fresh["sections"] and fresh["sections_v"] == 2
+
+
+def test_reconcile_client_sections_guards_against_stale_clients():
+    from pr_reviewer.config import reconcile_client_sections
+
+    stale = {"sections": ["net_effect", "unexplained", "files"]}           # old page: no version
+    out = reconcile_client_sections(stale)
+    assert out["sections"] == ["net_effect", "unexplained", "architecture", "files"]
+    assert out["sections_v"] == 2
+    current = {"sections": ["net_effect", "unexplained", "files"], "sections_v": 2}  # user hid it
+    assert "architecture" not in reconcile_client_sections(current)["sections"]
+    assert reconcile_client_sections({"instructions": "x"}) == {"instructions": "x"}  # untouched

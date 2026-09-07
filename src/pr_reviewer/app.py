@@ -111,6 +111,8 @@ async def put_settings(section: str, body: SettingsUpdate) -> dict[str, Any]:
         raise HTTPException(404, f"unknown section '{section}'")
     allowed = set(config.DEFAULT_CONFIG[section])
     values = {k: v for k, v in body.values.items() if k in allowed}
+    if section == "custom_review" and "sections" in values:
+        values = config.reconcile_client_sections({**values, "sections_v": body.values.get("sections_v")})
     config.update_section(section, values)
     return _masked(config.load_config())
 
@@ -963,6 +965,10 @@ async def publish_review(rid: str, body: PublishRequest) -> dict[str, Any]:
             lines.append(f"  - _why:_ {link.why}")
         if link.missing:
             lines.append(f"  - _missing:_ {link.missing}")
+    if review.architecture:
+        lines.append("")
+        lines.append("**Architectural considerations:**")
+        lines += [f"- _{a.kind}_ — **{a.title}**" + (f": {a.note}" if a.note else "") for a in review.architecture]
     if review.unexplained:
         lines.append("")
         more_u = f" …and {len(review.unexplained) - 8} more" if len(review.unexplained) > 8 else ""

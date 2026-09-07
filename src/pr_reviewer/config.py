@@ -35,7 +35,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "custom_review": {
         "instructions": "",
         "findings_group_by": "severity",
-        "sections": ["net_effect", "requirements", "unexplained", "findings", "files"],
+        "sections": ["net_effect", "requirements", "unexplained", "architecture", "findings", "files"],
+        # Version of the section list. Defaults to the LEGACY version on purpose:
+        # a saved config without the key predates every migration, and
+        # load_config fills defaults before migrating.
+        "sections_v": 1,
     },
     "pins": [],  # individually added PRs: "provider:owner/repo:number"
 }
@@ -55,15 +59,47 @@ def change_pin(rid: str, add: bool) -> list[str]:
 
 def load_config() -> dict[str, Any]:
     with _lock:
-        if not CONFIG_PATH.exists():
-            return json.loads(json.dumps(DEFAULT_CONFIG))
-        cfg = json.loads(CONFIG_PATH.read_text())
+        cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
     for key, val in DEFAULT_CONFIG.items():
-        cfg.setdefault(key, val)
+        cfg.setdefault(key, json.loads(json.dumps(val)))
         if isinstance(val, dict):
             for k2, v2 in val.items():
                 cfg[key].setdefault(k2, v2)
+    _migrate_sections(cfg["custom_review"])
     return cfg
+
+
+# Sections added after a user saved their own order/visibility would otherwise
+# stay invisible forever; each version step inserts its new key once.
+_SECTION_MIGRATIONS: list[tuple[int, str, str]] = [
+    (2, "architecture", "unexplained"),  # (version, new key, insert after)
+]
+
+
+def _migrate_sections(cr: dict[str, Any]) -> None:
+    have = int(cr.get("sections_v") or 1)
+    sections: list[str] = list(cr.get("sections") or [])
+    for version, key, after in _SECTION_MIGRATIONS:
+        if have >= version or key in sections:
+            continue
+        idx = sections.index(after) + 1 if after in sections else len(sections)
+        sections.insert(idx, key)
+    cr["sections"] = sections
+    cr["sections_v"] = max(have, *(v for v, _, _ in _SECTION_MIGRATIONS))
+
+
+def reconcile_client_sections(values: dict[str, Any]) -> dict[str, Any]:
+    """Apply a client's `sections` write without letting a stale client erase
+    keys it never knew about. A page loaded before a new section shipped sends
+    the old list (and no `sections_v`); re-applying the migrations newer than
+    the version the client declares restores what it could not have unchecked.
+    A current client that deliberately hides a key sends the current version,
+    so its choice sticks."""
+    if "sections" not in values:
+        return values
+    cr = {"sections": list(values["sections"]), "sections_v": int(values.get("sections_v") or 1)}
+    _migrate_sections(cr)
+    return {**values, **cr}
 
 
 def save_config(cfg: dict[str, Any]) -> None:

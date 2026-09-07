@@ -1340,6 +1340,24 @@ function summaryTabHtml(r) {
     html += `</tbody></table>`;
   }
 
+  html += "<!--SEC:architecture-->";
+  if ((r.architecture || []).length) {
+    html += `<div class="sum-section">Architectural considerations · ${r.architecture.length}</div>
+    <table class="sum"><thead><tr>
+      <th class="sum-fit">ID</th><th class="sum-fit">Kind</th><th>Consideration</th><th>Why it matters</th><th>Where</th>
+    </tr></thead><tbody>`;
+    for (const a of r.architecture) {
+      html += `<tr>
+        <td class="sum-fit"><span class="rid" style="background:#6e5494">${a.id}</span></td>
+        <td class="sum-fit"><span class="pill ${ARCH_KIND_PILL[a.kind] || "idle"}">${esc(a.kind)}</span></td>
+        <td>${esc(a.title)}</td>
+        <td class="sum-muted">${md(a.note || "")}</td>
+        <td>${a.anchors.length ? whereChips(a.anchors) : `<span class="sum-muted">whole PR</span>`}</td>
+      </tr>`;
+    }
+    html += `</tbody></table>` + overflowNote(r, "architecture", "architectural considerations");
+  }
+
   html += "<!--SEC:findings-->";
   if (r.bugs_ran) {
     const sevPill = { high: "err", medium: "warn", low: "idle" };
@@ -1399,7 +1417,15 @@ function summaryTabHtml(r) {
   return composeSummary(html);
 }
 
-const SUM_SECTION_KEYS = ["net_effect", "requirements", "unexplained", "findings", "files"];
+const SUM_SECTION_KEYS = ["net_effect", "requirements", "unexplained", "architecture", "findings", "files"];
+// Bump alongside config._SECTION_MIGRATIONS: tells the server which section
+// keys this page knows, so a stale tab can't erase a newer one.
+const SUM_SECTIONS_V = 2;
+// coupling/layering/duplication read as warnings; api/data as informational
+const ARCH_KIND_PILL = {
+  coupling: "warn", layering: "warn", duplication: "warn", consistency: "warn",
+  api: "info", data: "info", extensibility: "info", other: "idle",
+};
 function crSectionRows() {
   const cfg = state.settings?.custom_review;
   const enabled = Array.isArray(cfg?.sections) && cfg.sections.length ? cfg.sections : [...SUM_SECTION_KEYS];
@@ -1415,7 +1441,8 @@ function crSectionRows() {
 
 const SUM_SECTION_LABELS = {
   net_effect: "Net effect", requirements: "Requirements",
-  unexplained: "Unexplained changes", findings: "Findings", files: "Files",
+  unexplained: "Unexplained changes", architecture: "Architectural considerations",
+  findings: "Findings", files: "Files",
 };
 
 // The summary builds linearly with <!--SEC:x--> markers; reassemble per the
@@ -2183,7 +2210,7 @@ function renderSettings() {
         if (j < 0 || j >= order.length) return;
         [order[i], order[j]] = [order[j], order[i]];
       }
-      await api("/api/settings/custom_review", { method: "PUT", body: { values: { sections: order } } });
+      await api("/api/settings/custom_review", { method: "PUT", body: { values: { sections: order, sections_v: SUM_SECTIONS_V } } });
       state.settings.custom_review = { ...cfg, sections: order };
       renderSettings();
       if (state.review) renderReview(state.review);
