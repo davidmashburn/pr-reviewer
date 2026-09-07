@@ -458,7 +458,7 @@ function reviewJobCard(rid) {
   if (!jobId) return "";
   return `<div class="job-card compact" data-rid="${esc(rid)}">
     <span class="spin"></span>
-    <span class="job-detail" id="job-detail">Re-running review — current results shown below may be replaced…</span>
+    <span class="job-detail" id="job-detail">Review job running — results below update when it finishes…</span>
     <button class="btn small" data-cancel-job="${esc(jobId)}">✕ Cancel</button>
   </div>`;
 }
@@ -484,23 +484,47 @@ function watchReviewJob(rid, jobId) {
       const stg = card.querySelector("#job-stages");
       if (stg) stg.innerHTML = renderStages(st.stage, false, false);
     }
+    // EARLY OPEN: the mapping is saved minutes before findings finish — show
+    // the review immediately; the compact card stays up while findings run
+    if (!st.done && st.review_ready && state.pendingRid === rid) {
+      state.pendingRid = null;
+      await openReview(rid);
+      return;
+    }
     if (!st.done) return;
 
     clearInterval(state.reviewWatch[rid]);
     delete state.reviewWatch[rid];
     delete state.reviewJobs[rid];
     if (st.error) {
-      if (state.pendingRid === rid) {
+      if (st.review_ready) {
+        // the review itself was saved — show it rather than a dead-end card
+        toast(st.error === "Cancelled"
+          ? "Findings cancelled — review saved without a fresh findings pass"
+          : `Findings failed: ${st.error} — review saved without them`, st.error !== "Cancelled");
+        if (state.pendingRid === rid) {
+          state.pendingRid = null;
+          await openReview(rid);
+        } else if (state.review?.id === rid) {
+          renderReview();  // drop the compact card
+        }
+      } else if (state.pendingRid === rid) {
         showPendingReview(rid, st);          // card flips to its error state
       } else {
         toast(`Review ${st.error === "Cancelled" ? "cancelled" : "failed: " + st.error}`, st.error !== "Cancelled");
-        if (state.review?.id === rid) renderReview();  // drop the compact card
+        if (state.review?.id === rid) renderReview();
       }
     } else {
       toast("Review complete ✓");
-      if (state.pendingRid === rid || state.review?.id === rid) {
+      if (state.pendingRid === rid) {
         state.pendingRid = null;
         await openReview(rid);
+      } else if (state.review?.id === rid) {
+        // findings landed while the user reads — refresh data, KEEP their tab
+        try {
+          state.review = await api(`/api/reviews/${rid}/data`);
+          renderReview();
+        } catch {}
       }
     }
     loadPRs(); // refresh command-center summaries in the background
@@ -1071,6 +1095,72 @@ function showFindingPage(fid) {
   show("finding");
 }
 
+const FD_CTX = 8; // context rows shown around the finding's anchored lines
+
+function findingCodeHtml(r, b) {
+  const blocks = [];
+  const targets = (b.anchors || []).length
+    ? b.anchors.map((a) => ({ file: a.file, start: a.start, end: a.end, anchored: true }))
+    : (b.cited_file ? [{ file: b.cited_file, start: b.cited_line || 0,
+                         end: b.cited_line || 0, anchored: false }] : []);
+  for (const t of targets) {
+    const f = (r.files || []).find((x) => x.path === t.file);
+    if (!f) {
+      blocks.push(`<div class="fd-file"><div class="fd-file-head">${esc(t.file)}</div>
+        <div class="fd-none">This file isn't part of the diff — the finding points at unchanged code${t.start ? ` (line ${t.start})` : ""}. Use "inspect the repo" in a question to pull it in.</div></div>`);
+      continue;
+    }
+    const lo = t.start ? t.start - FD_CTX : 1;
+    const hi = t.end ? t.end + FD_CTX : Number.MAX_SAFE_INTEGER;
+    const rows = f.rows.filter((row) => {
+      if (row.gap) return false;
+      const line = row.n ? row.n[0] : (row.o ? row.o[0] : 0);
+      return line >= lo && line <= hi;
+    }).slice(0, 120);
+    if (!rows.length) {
+      blocks.push(`<div class="fd-file"><div class="fd-file-head">${esc(t.file)}</div>
+        <div class="fd-none">Cited lines fall outside the changed hunks.</div></div>`);
+      continue;
+    }
+    let rowsHtml = "";
+    // UNIFIED layout: a half-width panel can't afford side-by-side columns —
+    // split view here shreds lines mid-word and wastes the old column on
+    // addition-heavy hunks (the exact failure the diff research measured)
+    const uniRow = (oldNo, newNo, cls, marker, text, hl, line) => `
+      <tr class="${hl ? "hl" : ""}" data-file="${esc(f.path)}" ${newNo ? `data-line="${newNo}"` : ""}>
+        <td class="lineno old-no">${oldNo || ""}</td>
+        <td class="lineno new-no">${newNo || ""}</td>
+        <td class="code ${cls}"><span class="marker">${marker}</span> ${esc(text)}</td>
+        <td class="tags">${newNo ? tagsFor(f.path, newNo).map((tg) =>
+          `<span class="rtag" data-card="${tg}" style="background:${colorFor(tg)}" title="${esc(tg)}">${tg}</span>`).join("") : ""}</td>
+      </tr>`;
+    const inA = (line) => t.anchored && line >= t.start && line <= t.end;
+    const first = rows[0], last = rows[rows.length - 1];
+    if (f.rows.indexOf(first) > 0) rowsHtml += `<tr class="hunk-gap"><td colspan="4">⋯</td></tr>`;
+    for (const row of rows) {
+      const o = row.o, n = row.n;
+      if (o && n && o[1] === n[1]) {
+        rowsHtml += uniRow(o[0], n[0], "", " ", n[1], inA(n[0]));
+      } else {
+        if (o) rowsHtml += uniRow(o[0], "", "side-del", "-", o[1], false);
+        if (n) rowsHtml += uniRow("", n[0], "side-add", "+", n[1], inA(n[0]));
+      }
+    }
+    if (f.rows.indexOf(last) < f.rows.length - 1) rowsHtml += `<tr class="hunk-gap"><td colspan="4">⋯</td></tr>`;
+    blocks.push(`<div class="fd-file">
+      <div class="fd-file-head"><span>${esc(t.file)}</span>
+        ${t.anchored ? `<a class="fnd-loc" data-back-goto="${esc(t.file)}|${t.start}">lines ${t.start}${t.end !== t.start ? `–${t.end}` : ""} · open in Review ↗</a>` : ""}</div>
+      <table class="diff fd-uni"><colgroup>
+        <col style="width:40px"><col style="width:40px"><col><col style="width:48px">
+      </colgroup>${rowsHtml}</table>
+      <div class="fd-legend"><i class="lg-add"></i> added <i class="lg-del"></i> removed <i class="lg-hl"></i> this finding's lines</div></div>`);
+  }
+  if (!blocks.length) {
+    blocks.push(`<div class="fd-file"><div class="fd-none">The report gave no location for this finding.</div></div>`);
+  }
+  return blocks.join("");
+}
+
 function renderFindingPage() {
   const r = state.review, fid = state.findingId;
   const b = (r?.bugs || []).find((x) => x.id === fid);
@@ -1091,6 +1181,9 @@ function renderFindingPage() {
     <div class="ask-head">
       <span class="filter" data-back-review>‹ Back to review</span>
     </div>
+    <div class="fd-grid">
+    <div class="fd-code">${findingCodeHtml(r, b)}</div>
+    <div class="fd-flow">
     <div class="card" style="border-left:4px solid ${SEV_COLORS[sev]}">
       <div class="card-top">
         <span class="rid" style="background:${SEV_COLORS[sev]}">${esc(b.id)}</span>
@@ -1124,6 +1217,8 @@ function renderFindingPage() {
         <label class="ask-inspect"><input type="checkbox" id="ask-inspect"> Let it inspect the repo (slower, deeper)</label>
         <button class="btn primary" id="ask-send" ${state.askPending ? "disabled" : ""}>Ask</button>
       </div>
+    </div>
+    </div>
     </div>`;
   $("#fe-save")?.addEventListener("click", async () => {
     const body = { severity: $("#fe-sev").value, category: $("#fe-cat").value, note: $("#fe-note").value };
@@ -2001,8 +2096,15 @@ function renderSettings() {
         </div>
         ${pillFor("linear")}
       </div>
+      ${state.settings.linear.oauth?.connected
+        ? `<div class="checkline"><span class="ok">✓</span> Connected via browser auth — auto-refreshing
+             <button class="btn small" id="linear-disconnect" style="margin-left:8px">Disconnect</button></div>`
+        : `<div class="int-body">
+             <button class="btn primary" id="linear-connect">Connect with Linear</button>
+             <span class="int-note" style="margin:0">One click — approve in the browser. No app registration needed.</span>
+           </div>`}
       <div class="int-body">
-        ${secretInput("linear", "api_key", "lin_api_… personal API key")}
+        ${secretInput("linear", "api_key", "lin_api_… personal API key (fallback)")}
         <button class="btn" data-save="linear">Save</button>
         <button class="btn" data-test="linear">Test connection</button>
       </div>
@@ -2086,6 +2188,30 @@ function renderSettings() {
       renderSettings();
       if (state.review) renderReview(state.review);
     });
+  });
+  $("#linear-connect")?.addEventListener("click", async () => {
+    try {
+      const { url } = await api("/api/linear/oauth/start", { method: "POST" });
+      window.open(url, "_blank");
+      toast("Approve in the browser — I'll pick it up automatically");
+      for (let i = 0; i < 90; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        state.settings = await api("/api/settings");
+        if (state.settings.linear.oauth?.connected) {
+          toast("Linear connected ✓");
+          renderSettings();
+          return;
+        }
+      }
+    } catch (e) {
+      toast(`Linear connect failed: ${e.message}`, true);
+    }
+  });
+  $("#linear-disconnect")?.addEventListener("click", async () => {
+    await api("/api/linear/oauth/disconnect", { method: "POST" });
+    state.settings = await api("/api/settings");
+    toast("Linear browser auth disconnected");
+    renderSettings();
   });
   $("#auto-review-toggle")?.addEventListener("change", async (e) => {
     await api("/api/settings/auto_review", { method: "PUT", body: { values: { enabled: e.target.checked } } });

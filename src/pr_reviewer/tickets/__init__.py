@@ -14,7 +14,8 @@ def build_sources(cfg: dict[str, Any]) -> dict[str, RequirementsSource]:
     lin = cfg.get("linear", {})
     jira = cfg.get("jira", {})
     return {
-        "linear": LinearSource(api_key=lin.get("api_key", "")),
+        "linear": LinearSource(api_key=lin.get("api_key", ""),
+                               oauth_token=lin.get("oauth_access_token", "")),
         "jira": JiraSource(
             site_url=jira.get("site_url", ""),
             email=jira.get("email", ""),

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -26,7 +26,7 @@ STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
 SECRET_FIELDS = {
     "github": ["token"],
     "bitbucket": ["app_password"],
-    "linear": ["api_key"],
+    "linear": ["api_key", "oauth_access_token", "oauth_refresh_token"],
     "jira": ["api_token"],
 }
 
@@ -88,6 +88,11 @@ def _masked(cfg: dict[str, Any]) -> dict[str, Any]:
     from .providers.github import gh_cli_token
 
     out["github"]["gh_cli"] = {"active": not cfg["github"].get("token") and bool(gh_cli_token())}
+    lin = cfg.get("linear", {})
+    out["linear"]["oauth"] = {
+        "connected": bool(lin.get("oauth_access_token")),
+        "expires_at": lin.get("oauth_expires_at", ""),
+    }
     return out
 
 
@@ -108,6 +113,184 @@ async def put_settings(section: str, body: SettingsUpdate) -> dict[str, Any]:
     values = {k: v for k, v in body.values.items() if k in allowed}
     config.update_section(section, values)
     return _masked(config.load_config())
+
+
+# ---------------------------------------------------------------- linear oauth (PKCE)
+
+# Linear's MCP authorization server supports Dynamic Client Registration
+# (verified via /.well-known/oauth-authorization-server) — the app registers
+# ITSELF, so connecting is one click with no OAuth-app setup, like Claude Desktop.
+LINEAR_AUTH_URL = "https://mcp.linear.app/authorize"
+LINEAR_TOKEN_URL = "https://mcp.linear.app/token"
+LINEAR_REGISTER_URL = "https://mcp.linear.app/register"
+LINEAR_RESOURCE = "https://mcp.linear.app/mcp"
+
+
+async def _linear_dcr_client_id(redirect_uri: str) -> str:
+    """Return a client id, dynamically registering one if we have none stored."""
+    import httpx
+
+    lin = config.load_config().get("linear", {})
+    if lin.get("client_id"):
+        return lin["client_id"]
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(LINEAR_REGISTER_URL, json={
+            "client_name": "PR Reviewer (local)",
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        })
+    r.raise_for_status()
+    client_id = r.json().get("client_id", "")
+    if not client_id:
+        raise HTTPException(502, "Linear registration returned no client_id")
+    config.update_section("linear", {"client_id": client_id})
+    return client_id
+_OAUTH_PENDING: dict[str, dict[str, Any]] = {}  # state -> {verifier, redirect_uri, ts}
+_OAUTH_TTL_S = 600
+
+
+def _pkce_pair() -> tuple[str, str]:
+    """(code_verifier, S256 code_challenge) per RFC 7636."""
+    import base64
+    import hashlib
+    import secrets
+
+    verifier = secrets.token_urlsafe(48)
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _needs_refresh(expires_at: str, skew_s: int = 300) -> bool:
+    """True when the access token is missing an expiry or within skew of it."""
+    dt = _parse_iso(expires_at)
+    if dt is None or dt.tzinfo is None:
+        return True
+    from datetime import timedelta
+    return datetime.now(timezone.utc) >= dt - timedelta(seconds=skew_s)
+
+
+async def ensure_linear_token(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Refresh the Linear OAuth access token if it is near expiry (24h life).
+    Failure is non-fatal: ticket fetch degrades to skipped-source, as ever."""
+    import httpx
+
+    lin = cfg.get("linear", {})
+    if not lin.get("oauth_refresh_token") or not _needs_refresh(lin.get("oauth_expires_at", "")):
+        return cfg
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(LINEAR_TOKEN_URL, data={
+                "grant_type": "refresh_token",
+                "refresh_token": lin["oauth_refresh_token"],
+                "client_id": lin.get("client_id", ""),
+                "resource": LINEAR_RESOURCE,
+            })
+        r.raise_for_status()
+        tok = r.json()
+    except Exception as e:
+        print(f"[linear-oauth] refresh failed: {type(e).__name__}: {e}")
+        return cfg
+    from datetime import timedelta
+    config.update_section("linear", {
+        "oauth_access_token": tok.get("access_token", ""),
+        "oauth_refresh_token": tok.get("refresh_token", lin["oauth_refresh_token"]),
+        "oauth_expires_at": (datetime.now(timezone.utc)
+                             + timedelta(seconds=int(tok.get("expires_in", 86399)))).isoformat(),
+    })
+    return config.load_config()
+
+
+@app.post("/api/linear/oauth/start")
+async def linear_oauth_start(request: Request) -> dict[str, Any]:
+    import secrets
+    import time as _time
+    from urllib.parse import urlencode
+
+    redirect_uri = str(request.base_url) + "api/linear/callback"
+    try:
+        client_id = await _linear_dcr_client_id(redirect_uri)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Could not register with Linear: {type(e).__name__}: {e}")
+    state = secrets.token_urlsafe(24)
+    verifier, challenge = _pkce_pair()
+    now = _time.time()
+    for k in [k for k, v in _OAUTH_PENDING.items() if now - v["ts"] > _OAUTH_TTL_S]:
+        _OAUTH_PENDING.pop(k, None)
+    _OAUTH_PENDING[state] = {"verifier": verifier, "redirect_uri": redirect_uri, "ts": now}
+    url = LINEAR_AUTH_URL + "?" + urlencode({
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": "read",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "resource": LINEAR_RESOURCE,
+    })
+    return {"url": url}
+
+
+def _oauth_page(title: str, body: str, ok: bool) -> Any:
+    from fastapi.responses import HTMLResponse
+
+    color = "#1a7f37" if ok else "#cf222e"
+    return HTMLResponse(f"""<!doctype html><meta charset='utf-8'>
+<body style='font-family:-apple-system,sans-serif;display:flex;height:90vh;align-items:center;justify-content:center'>
+<div style='text-align:center;max-width:420px'>
+<h2 style='color:{color}'>{title}</h2><p style='color:#59636e'>{body}</p>
+</div></body>""", status_code=200 if ok else 400)
+
+
+@app.get("/api/linear/callback")
+async def linear_oauth_callback(state: str = "", code: str = "", error: str = "") -> Any:
+    import time as _time
+
+    import httpx
+
+    if error:
+        return _oauth_page("Linear connection refused", f"Linear reported: {error}", ok=False)
+    pending = _OAUTH_PENDING.pop(state, None)
+    if not pending or _time.time() - pending["ts"] > _OAUTH_TTL_S:
+        return _oauth_page("Connection attempt expired",
+                           "Unknown or stale state — start again from PR Reviewer settings.", ok=False)
+    lin = config.load_config().get("linear", {})
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(LINEAR_TOKEN_URL, data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": pending["redirect_uri"],
+                "client_id": lin.get("client_id", ""),
+                "code_verifier": pending["verifier"],
+                "resource": LINEAR_RESOURCE,
+            })
+        r.raise_for_status()
+        tok = r.json()
+    except Exception as e:
+        return _oauth_page("Token exchange failed", f"{type(e).__name__}: {e}", ok=False)
+    from datetime import timedelta
+    config.update_section("linear", {
+        "oauth_access_token": tok.get("access_token", ""),
+        "oauth_refresh_token": tok.get("refresh_token", ""),
+        "oauth_expires_at": (datetime.now(timezone.utc)
+                             + timedelta(seconds=int(tok.get("expires_in", 86399)))).isoformat(),
+    })
+    return _oauth_page("Linear connected ✓",
+                       "Browser auth complete — you can close this tab and return to PR Reviewer.", ok=True)
+
+
+@app.post("/api/linear/oauth/disconnect")
+async def linear_oauth_disconnect() -> dict[str, Any]:
+    config.update_section("linear", {
+        "oauth_access_token": "", "oauth_refresh_token": "", "oauth_expires_at": "",
+        "client_id": "",
+    })
+    return {"disconnected": True}
 
 
 @app.get("/api/skills")
@@ -131,6 +314,8 @@ async def test_connection(section: str) -> dict[str, Any]:
     if section in ("github", "bitbucket"):
         return await build_providers(cfg)[section].test_connection()
     if section in ("linear", "jira"):
+        if section == "linear":
+            cfg = await ensure_linear_token(cfg)
         return await build_sources(cfg)[section].test_connection()
     raise HTTPException(404, f"no connection test for '{section}'")
 
@@ -441,7 +626,7 @@ class ReviewRequest(BaseModel):
 
 @app.post("/api/reviews")
 async def start_review(body: ReviewRequest) -> dict[str, Any]:
-    cfg = config.load_config()
+    cfg = await ensure_linear_token(config.load_config())
     providers = build_providers(cfg)
 
     if body.url:
@@ -470,7 +655,8 @@ async def start_review(body: ReviewRequest) -> dict[str, Any]:
         raise HTTPException(409, f"Claude backend not ready: {status.summary}. {status.fix}")
 
     job_id = uuid.uuid4().hex[:12]
-    job = {"stage": "queued", "detail": "Queued", "error": None, "done": False, "review_id": rid}
+    job = {"stage": "queued", "detail": "Queued", "error": None, "done": False,
+           "review_id": rid, "review_ready": False}
     JOBS[job_id] = job
     RUNNING[rid] = job_id
 
@@ -505,6 +691,9 @@ async def start_review(body: ReviewRequest) -> dict[str, Any]:
             if prev is not None:
                 progress("save", "Carrying over verified/reviewer state")
                 await merge_rerun_state(review, prev, backend, progress)
+            # the mapping is saved — the UI can open the review NOW; findings
+            # keep running and land in place when ready
+            job["review_ready"] = True
             progress("findings", "Collecting code-review findings")
             try:
                 findings, report, dropped = await run_code_review(
@@ -523,6 +712,9 @@ async def start_review(body: ReviewRequest) -> dict[str, Any]:
                     latest.bugs_report = report
                     if dropped:
                         latest.overflow = {**latest.overflow, "findings": dropped}
+                    # re-snapshot usage: the findings calls happened after
+                    # run_review took its snapshot, so totals were undercounted
+                    latest.llm_usage = dict(getattr(backend, "usage", {}) or {})
                     config.save_review(latest)
                 progress("done", "Review complete")
         except asyncio.CancelledError:

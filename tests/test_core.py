@@ -618,3 +618,32 @@ def test_finding_edits_survive_reruns():
     assert b1.note == "config-driven, not remote — one-line fix"
     assert out[1].note == "ok to ship" and not out[1].edited  # note-only carry
     assert out[2].title == "Brand new" and out[2].note == "" and not out[2].edited
+
+
+def test_linear_oauth_helpers():
+    """PKCE S256 correctness, refresh boundaries, and auth-mode preference."""
+    import base64
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+
+    from pr_reviewer.app import _needs_refresh, _pkce_pair
+    from pr_reviewer.tickets import build_sources
+
+    # challenge must be BASE64URL(SHA256(verifier)) without padding (RFC 7636)
+    verifier, challenge = _pkce_pair()
+    expect = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    assert challenge == expect and "=" not in challenge and len(verifier) >= 43
+
+    now = datetime.now(timezone.utc)
+    assert _needs_refresh("")  # unknown expiry -> refresh
+    assert _needs_refresh((now + timedelta(seconds=60)).isoformat())   # inside skew
+    assert not _needs_refresh((now + timedelta(hours=2)).isoformat())  # fresh
+
+    # OAuth token wins over the api key; header styles differ per Linear's rules
+    cfg = {"linear": {"api_key": "lin_api_SYNTHETIC", "oauth_access_token": "oat_x"},
+           "jira": {}}
+    lin = build_sources(cfg)["linear"]
+    assert lin._auth() == "Bearer oat_x"
+    cfg["linear"]["oauth_access_token"] = ""
+    assert build_sources(cfg)["linear"]._auth() == "lin_api_SYNTHETIC"

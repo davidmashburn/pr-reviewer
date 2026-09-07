@@ -17,7 +17,10 @@ _lock = threading.Lock()
 DEFAULT_CONFIG: dict[str, Any] = {
     "github": {"token": "", "repos": []},
     "bitbucket": {"username": "", "app_password": "", "repos": []},
-    "linear": {"api_key": ""},
+    # api_key is the manual fallback; the oauth_* fields are written by the
+    # browser-auth flow (PKCE) and rotate automatically (24h access tokens).
+    "linear": {"api_key": "", "client_id": "", "oauth_access_token": "",
+               "oauth_refresh_token": "", "oauth_expires_at": ""},
     "jira": {"site_url": "", "email": "", "api_token": ""},
     # skills_dir: where to discover user skills ("" = ~/.claude/skills).
     # review_skill: skill slash-command for the code-review pass ("" = built-in /code-review).
