@@ -1693,6 +1693,7 @@ function renderReview() {
           }</button>
           ${pr.provider === "github" ? `<button class="btn small" id="publish-btn" title="${r.published_url ? esc("Already posted " + (r.published_at || "").slice(0, 10) + " — click to post again") : "Post this review to the PR on GitHub"}">${r.published_url ? "↗ Published" : "↑ Publish"}</button>` : ""}
           <button class="btn small" id="delete-btn" title="Delete this stored review">🗑</button>
+          <a class="btn small" href="/api/reviews/${esc(r.id)}/bygone-tour" title="Download a Bygone change tour for this review">Export tour ⇩</a>
           <a class="btn small" href="${esc(pr.url)}" target="_blank" rel="noopener">Open PR ↗</a>
         </span>
       </div>
