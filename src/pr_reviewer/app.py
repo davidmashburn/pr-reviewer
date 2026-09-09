@@ -834,6 +834,23 @@ async def get_review(rid: str) -> Any:
     return JSONResponse({**review.model_dump(), "stale": stale})
 
 
+@app.get("/api/reviews/{rid:path}/bygone-tour")
+async def bygone_tour(rid: str) -> Any:
+    from .bygone_export import review_to_bygone_yaml
+
+    review = config.load_review(rid)
+    if review is None:
+        raise HTTPException(404, "no stored review")
+    yaml_text = review_to_bygone_yaml(review)
+    filename = rid.replace("/", "-").replace(":", "-") + ".bygone.yaml"
+    from fastapi.responses import Response
+
+    return Response(
+        content=yaml_text, media_type="application/x-yaml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.delete("/api/reviews/{rid:path}")
 async def remove_review(rid: str) -> dict[str, Any]:
     from .bugs import cleanup_sandbox

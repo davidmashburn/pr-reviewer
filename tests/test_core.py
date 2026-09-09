@@ -716,6 +716,83 @@ def test_load_config_migrates_saved_sections(tmp_path, monkeypatch):
     assert "architecture" in fresh["sections"] and fresh["sections_v"] == 2
 
 
+def test_bygone_tour_yaml_from_fixture_review():
+    """The exported tour is faithful to Bygone's format: net_effect -> scene
+    summary/bullets, each linked requirement/bug -> one step anchored on its
+    first evidence anchor, with literal `contains` text recovered from the
+    stored diff rows (never invented)."""
+    import yaml
+
+    from pr_reviewer.bygone_export import review_to_bygone_yaml
+    from pr_reviewer.models import (Anchor, BugFinding, DiffRow, FileDiff, Link, PRInfo,
+                                    Requirement, Review)
+
+    review = Review(
+        id="github:x/y:1",
+        pr=PRInfo(provider="github", repo="x/y", number=1,
+                  url="https://github.com/x/y/pull/1", title="Add login lockout"),
+        mode="requirements",
+        requirements=[Requirement(id="R1", text="Lock account after 5 failures",
+                                  source="pr-description")],
+        links=[Link(requirement_id="R1", status="fulfilled", confidence="high",
+                    mechanism="Adds check_lockout()", why="Gates login before verify",
+                    anchors=[Anchor(file="auth/lockout.py", start=3, end=3)])],
+        bugs=[BugFinding(id="B1", severity="major", title="No rate limit on unlock",
+                         detail="Manual unlock has no rate limit.",
+                         anchors=[Anchor(file="auth/lockout.py", start=3, end=3)])],
+        net_effect=["Accounts lock after 5 failures", "Adds a lockout table"],
+        files=[FileDiff(path="auth/lockout.py", status="new", rows=[
+            DiffRow(gap="@@ -0,0 +1,5 @@"),
+            DiffRow(n=(1, "MAX_ATTEMPTS = 5")),
+            DiffRow(n=(2, "")),
+            DiffRow(n=(3, "def check_lockout(user_id):")),
+        ])],
+    )
+
+    doc = yaml.safe_load(review_to_bygone_yaml(review))
+    assert doc["version"] == 1
+    assert doc["title"] == "Add login lockout"
+    assert doc["sourceUrl"] == "https://github.com/x/y/pull/1"
+    assert doc["anchors"]["req-R1"] == {
+        "file": "auth/lockout.py", "revision": "head", "contains": "def check_lockout(user_id):"}
+    assert doc["anchors"]["bug-B1"]["file"] == "auth/lockout.py"
+
+    scene = doc["chapters"][0]["scenes"][0]
+    assert scene["summary"] == "Accounts lock after 5 failures"
+    assert scene["bullets"] == ["Adds a lockout table"]
+    assert [s["id"] for s in scene["steps"]] == ["req-R1", "bug-B1"]
+    req_step = scene["steps"][0]
+    assert req_step["focus"] == "req-R1"
+    assert req_step["requirement"] == {
+        "id": "R1", "text": "Lock account after 5 failures",
+        "status": "fulfilled", "source": "pr-description", "confidence": "high"}
+    assert scene["steps"][1]["title"] == "[MAJOR] No rate limit on unlock"
+
+
+def test_bygone_tour_endpoint_downloads_yaml(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from pr_reviewer import config as cfg_mod
+    from pr_reviewer.app import app
+    from pr_reviewer.models import Link, PRInfo, Review
+
+    monkeypatch.setattr(cfg_mod, "REVIEWS_DIR", tmp_path)
+    review = Review(
+        id="github:x/y:1",
+        pr=PRInfo(provider="github", repo="x/y", number=1, url="https://github.com/x/y/pull/1", title="t"),
+        mode="requirements",
+        requirements=[Requirement(id="R1", text="Lock account", source="pr-description")],
+        links=[Link(requirement_id="R1", status="notfound", confidence="low")],
+    )
+    cfg_mod.save_review(review)
+
+    client = TestClient(app)
+    res = client.get("/api/reviews/github:x/y:1/bygone-tour")
+    assert res.status_code == 200
+    assert "attachment" in res.headers["content-disposition"]
+    assert res.headers["content-disposition"].endswith('"github-x-y-1.bygone.yaml"')
+
+
 def test_reconcile_client_sections_guards_against_stale_clients():
     from pr_reviewer.config import reconcile_client_sections
 
