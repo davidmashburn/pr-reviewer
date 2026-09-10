@@ -726,3 +726,31 @@ def test_reconcile_client_sections_guards_against_stale_clients():
     current = {"sections": ["net_effect", "unexplained", "files"], "sections_v": 2}  # user hid it
     assert "architecture" not in reconcile_client_sections(current)["sections"]
     assert reconcile_client_sections({"instructions": "x"}) == {"instructions": "x"}  # untouched
+
+
+def test_scrub_venv_removes_app_interpreter_from_child_env():
+    import os
+    from pr_reviewer.llm.claude_cli import scrub_venv
+
+    venv = "/app/venv"
+    env = {
+        "VIRTUAL_ENV": venv,
+        "UV_PROJECT_ENVIRONMENT": venv,
+        "PYTHONPATH": "/app/src",
+        "PATH": os.pathsep.join([f"{venv}/bin", "/usr/local/bin", "/usr/bin"]),
+        "HOME": "/home/dev",
+    }
+    out = scrub_venv(env, venv)
+    assert not any(v in out for v in ("VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT", "PYTHONPATH"))
+    assert out["PATH"] == os.pathsep.join(["/usr/local/bin", "/usr/bin"])  # order preserved
+    assert out["PIP_REQUIRE_VIRTUALENV"] == "1"
+    assert out["HOME"] == "/home/dev"  # unrelated vars survive
+
+
+def test_scrub_venv_keeps_path_when_no_venv_on_it():
+    import os
+    from pr_reviewer.llm.claude_cli import scrub_venv
+
+    path = os.pathsep.join(["/usr/local/bin", "/usr/bin"])
+    out = scrub_venv({"PATH": path}, "/app/venv")
+    assert out["PATH"] == path

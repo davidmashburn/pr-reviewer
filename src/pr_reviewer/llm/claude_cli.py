@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
+import sys
+from pathlib import Path
 from typing import Any
 
 from ..config import DATA_DIR
@@ -20,6 +23,41 @@ SKILL_TIMEOUT_S = 1800  # tool-using skill runs (/code-review) legitimately take
 # ~/.pr-reviewer itself, whose config.json holds tokens a tool-enabled,
 # prompt-injected run could otherwise read.
 SANDBOX_DIR = DATA_DIR / "sandbox"
+
+# Environment variables that point a child at OUR interpreter. The server runs
+# under `uv run`, so it inherits VIRTUAL_ENV and a PATH headed by the app's own
+# venv; anything the child installs would land there.
+_VENV_VARS = ("VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT", "PYTHONPATH", "PYTHONHOME", "CONDA_PREFIX")
+
+
+def scrub_venv(env: dict[str, str], prefix: str) -> dict[str, str]:
+    """Remove every pointer to the interpreter at `prefix` from `env` (mutated
+    and returned). PATH keeps its order minus that venv's own directories."""
+    roots = {str(Path(p).resolve()) + os.sep for p in (prefix, env.get("VIRTUAL_ENV", "")) if p}
+    for var in _VENV_VARS:
+        env.pop(var, None)
+    if env.get("PATH"):
+        kept = [
+            entry for entry in env["PATH"].split(os.pathsep)
+            if not (entry and any((str(Path(entry).resolve()) + os.sep).startswith(r) for r in roots))
+        ]
+        env["PATH"] = os.pathsep.join(kept)
+    # Belt-and-braces: a bare `pip install` now fails loudly instead of
+    # silently writing to the user's site-packages.
+    env["PIP_REQUIRE_VIRTUALENV"] = "1"
+    return env
+
+
+def _child_env() -> dict[str, str]:
+    """Environment for the claude subprocess.
+
+    A review runs whatever tooling the PR's repo implies, and `uv pip install
+    -e .` on a Python project is routine. Inheriting our environment pointed
+    that install at the venv the app itself boots from: a fastapi review
+    replaced fastapi with an editable pointer into its own scratchpad, and the
+    app stopped importing once that temp directory was swept.
+    """
+    return scrub_venv(dict(os.environ), sys.prefix)
 
 
 def _exit_error(code: int, out: str, err: str) -> str:
@@ -65,6 +103,7 @@ class ClaudeCLIBackend:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(SANDBOX_DIR) if SANDBOX_DIR.exists() else None,
+            env=_child_env(),
         )
         try:
             out, err = await asyncio.wait_for(
