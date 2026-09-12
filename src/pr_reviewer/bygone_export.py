@@ -1,9 +1,11 @@
 """Export a Review as a Bygone change-tour YAML document.
 
 Format: https://github.com/hsiaotienfan/bygone/blob/main/docs/change-tour-format.md
-Mapping: net_effect -> scene summary/bullets; each requirement link and each
-bug finding -> one step, anchored at its first evidence anchor. `contains` is
-recovered from the stored diff rows (literal new-file text), not invented.
+Mapping: net_effect -> scene summary/bullets; each requirement link with
+evidence and each bug finding -> one step, anchored at its first evidence
+anchor. `contains` is recovered from the stored diff rows (literal new-file
+text), not invented. A requirement with no evidence anchor (partial/notfound)
+has no code to focus a step on, so it's listed in the scene's bullets instead.
 """
 from __future__ import annotations
 
@@ -15,6 +17,9 @@ from .models import Anchor, FileDiff, Review
 
 _SEV_LABEL = {"blocker": "BLOCKER", "major": "MAJOR", "minor": "MINOR", "nit": "NIT"}
 _ANCHOR_LINES = 3  # lines of literal text an anchor matches on
+# pr-reviewer's Status is fulfilled/partial/notfound; the tour schema's requirement.status
+# is fulfilled/gap. Both non-fulfilled values mean "not fully met" from the reviewer's diff.
+_BYGONE_STATUS = {"fulfilled": "fulfilled", "partial": "gap", "notfound": "gap"}
 
 
 def _anchor_text(files: list[FileDiff], anchor: Anchor) -> str:
@@ -79,18 +84,22 @@ def build_tour(review: Review) -> dict[str, Any]:
         anchors[key] = entry
         return key
 
+    unaddressed: list[str] = []
     for req in review.requirements:
         link = next((l for l in review.links if l.requirement_id == req.id), None)
-        if link is None or not link.anchors:
+        if link is None:
             continue
-        key = add_anchor(f"req-{req.id}", link.anchors[0])
+        key = add_anchor(f"req-{req.id}", link.anchors[0]) if link.anchors else None
         if key is None:
+            # nothing in the diff to anchor a step on (typically notfound/partial);
+            # a tour step requires a focus anchor, so record it in prose instead
+            reason = f" — {link.missing}" if link.missing else ""
+            unaddressed.append(f"{req.id} ({_BYGONE_STATUS[link.status]}, {req.source}): {req.text}{reason}")
             continue
         body = "\n\n".join(p for p in (link.mechanism, link.why) if p) or req.text
-        # the tour schema admits only these enum values; anything else is omitted
-        requirement: dict[str, Any] = {"id": req.id, "text": req.text}
-        if link.status in ("fulfilled", "gap"):
-            requirement["status"] = link.status
+        requirement: dict[str, Any] = {
+            "id": req.id, "text": req.text, "status": _BYGONE_STATUS[link.status],
+        }
         if req.source:
             requirement["source"] = req.source
         if link.confidence in ("high", "medium", "low"):
@@ -118,11 +127,15 @@ def build_tour(review: Review) -> dict[str, Any]:
         })
 
     fulfilled = sum(1 for l in review.links if l.status == "fulfilled")
+    bullets = [b for b in review.net_effect[1:] if b]
+    if unaddressed:
+        bullets.append("Not addressed by this diff:")
+        bullets.extend(f"  {line}" for line in unaddressed)
     scene = {
         "id": "review",
         "title": review.pr.title,
         "summary": review.net_effect[0] if review.net_effect else review.pr.title,
-        "bullets": [b for b in review.net_effect[1:] if b],
+        "bullets": bullets,
         "tags": ["requirements-review"],
         "takeaway": f"{fulfilled}/{len(review.requirements)} stated requirements are met by this diff.",
         "steps": steps,
