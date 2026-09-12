@@ -749,9 +749,11 @@ def test_load_config_migrates_saved_sections(tmp_path, monkeypatch):
 
 def test_bygone_tour_yaml_from_fixture_review():
     """The exported tour is faithful to Bygone's format: net_effect -> scene
-    summary/bullets, each linked requirement/bug -> one step anchored on its
-    first evidence anchor, with literal `contains` text recovered from the
-    stored diff rows (never invented)."""
+    summary/bullets, each linked requirement/bug with evidence -> one step
+    anchored on its first evidence anchor, with literal `contains` text
+    recovered from the stored diff rows (never invented). A requirement with
+    no evidence anchor (partial/notfound) can't anchor a step, so it's listed
+    in the scene's bullets instead of silently dropped."""
     import yaml
 
     from pr_reviewer.bygone_export import review_to_bygone_yaml
@@ -763,11 +765,21 @@ def test_bygone_tour_yaml_from_fixture_review():
         pr=PRInfo(provider="github", repo="x/y", number=1,
                   url="https://github.com/x/y/pull/1", title="Add login lockout"),
         mode="requirements",
-        requirements=[Requirement(id="R1", text="Lock account after 5 failures",
-                                  source="pr-description")],
-        links=[Link(requirement_id="R1", status="fulfilled", confidence="high",
-                    mechanism="Adds check_lockout()", why="Gates login before verify",
-                    anchors=[Anchor(file="auth/lockout.py", start=3, end=3)])],
+        requirements=[
+            Requirement(id="R1", text="Lock account after 5 failures", source="pr-description"),
+            Requirement(id="R2", text="Rate-limit the unlock endpoint", source="linear:PLAT-1"),
+            Requirement(id="R3", text="Emit an audit log entry on lockout", source="pr-description"),
+        ],
+        links=[
+            Link(requirement_id="R1", status="fulfilled", confidence="high",
+                mechanism="Adds check_lockout()", why="Gates login before verify",
+                anchors=[Anchor(file="auth/lockout.py", start=3, end=3)]),
+            Link(requirement_id="R2", status="partial", confidence="medium",
+                mechanism="Adds a lockout table", why="No throttling on the unlock path",
+                anchors=[Anchor(file="auth/lockout.py", start=1, end=1)]),
+            Link(requirement_id="R3", status="notfound", confidence="high",
+                missing="No logging call anywhere in the diff."),
+        ],
         bugs=[BugFinding(id="B1", severity="major", title="No rate limit on unlock",
                          detail="Manual unlock has no rate limit.",
                          anchors=[Anchor(file="auth/lockout.py", start=3, end=3)])],
@@ -787,17 +799,26 @@ def test_bygone_tour_yaml_from_fixture_review():
     assert doc["anchors"]["req-R1"] == {
         "file": "auth/lockout.py", "revision": "head", "contains": "def check_lockout(user_id):"}
     assert doc["anchors"]["bug-B1"]["file"] == "auth/lockout.py"
+    assert "req-R3" not in doc["anchors"]  # no evidence to anchor on
 
     scene = doc["chapters"][0]["scenes"][0]
     assert scene["summary"] == "Accounts lock after 5 failures"
-    assert scene["bullets"] == ["Adds a lockout table"]
-    assert [s["id"] for s in scene["steps"]] == ["req-R1", "bug-B1"]
+    # R2 has an anchor (partial, but with cited evidence) so it's a step, not a bullet
+    assert [s["id"] for s in scene["steps"]] == ["req-R1", "req-R2", "bug-B1"]
+    assert scene["bullets"] == [
+        "Adds a lockout table",
+        "Not addressed by this diff:",
+        "  R3 (gap, pr-description): Emit an audit log entry on lockout"
+        " — No logging call anywhere in the diff.",
+    ]
     req_step = scene["steps"][0]
     assert req_step["focus"] == "req-R1"
     assert req_step["requirement"] == {
         "id": "R1", "text": "Lock account after 5 failures",
         "status": "fulfilled", "source": "pr-description", "confidence": "high"}
-    assert scene["steps"][1]["title"] == "[MAJOR] No rate limit on unlock"
+    # "partial" (pr-reviewer's vocabulary) maps to "gap" (the tour schema's vocabulary)
+    assert scene["steps"][1]["requirement"]["status"] == "gap"
+    assert scene["steps"][2]["title"] == "[MAJOR] No rate limit on unlock"
 
 
 def test_bygone_tour_endpoint_downloads_yaml(tmp_path, monkeypatch):
