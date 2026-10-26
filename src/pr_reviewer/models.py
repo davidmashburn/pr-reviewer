@@ -184,7 +184,26 @@ class PRInfo(BaseModel):
     reviewers: list[str] = Field(default_factory=list)  # review requested from
 
 
+class PRCapture(BaseModel):
+    """Immutable input identity. Old saved reviews deliberately have no capture."""
+
+    version: Literal[1] = 1
+    provider: str
+    repository: str
+    number: int
+    base_oid: str = Field(pattern=r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
+    head_oid: str = Field(pattern=r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
+    merge_base_oid: str = Field(pattern=r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
+    diff_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    metadata_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    diff_spec: Literal["merge-base-to-head"] = "merge-base-to-head"
+    diff_bytes: int = Field(ge=0, le=16 * 1024 * 1024)
+    captured_at: str
+    limitations: list[str] = Field(default_factory=list)
+
+
 class PRContent(PRInfo):
+    capture: PRCapture | None = None
     diff: str = ""
 
 
@@ -199,6 +218,7 @@ class TicketContent(BaseModel):
 class Review(BaseModel):
     id: str  # provider:owner/repo:number
     pr: PRInfo
+    capture: PRCapture | None = None
     mode: Literal["requirements", "explain"]
     requirements: list[Requirement] = Field(default_factory=list)
     hunks: list[Hunk] = Field(default_factory=list)

@@ -1688,6 +1688,7 @@ function renderReview() {
         <span class="verify-progress">
           <span><b id="verified-count">${verifiedCount}</b>/${claims.length} claims verified</span>
           <button class="btn small" id="rerun-btn">↻ Re-run</button>
+          <button class="btn small" id="bygone-export-btn" ${r.capture ? '' : 'disabled'} title="${r.capture ? 'Download pinned evidence; checklist and approval state stay here' : 'Rerun with an evidence-capable provider to capture immutable revisions'}">Export Bygone evidence</button>
           <button class="btn small" id="bugs-btn" ${state.bugsJobs[r.id] ? "disabled" : ""}>${
             state.bugsJobs[r.id] ? `<span class="spin"></span> Findings…` : "↻ Findings"
           }</button>
@@ -1731,6 +1732,14 @@ function renderReview() {
           document.querySelector(`tr[data-file="${CSS.escape(a.file)}"][data-line="${ln}"]`)?.classList.add("unx");
   }
 
+  $("#bygone-export-btn")?.addEventListener("click", async () => {
+    try {
+      const payload = await api(`/api/reviews/${r.id}/export/bygone/v2`);
+      const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
+      const link = document.createElement("a"); link.href = url; link.download = "review.bygone-evidence.json";
+      link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) { alert(`Evidence export failed: ${error.message}`); }
+  });
   $("#rerun-btn").addEventListener("click", (e) => {
     e.stopPropagation();
     startReview({ provider: pr.provider, repo: pr.repo, number: pr.number, force: true });

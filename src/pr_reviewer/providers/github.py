@@ -3,6 +3,11 @@ CLI's browser-based login (`gh auth login`) via `gh auth token` — credentials
 stay managed by gh, mirroring the Claude backend approach (DECISIONS #14)."""
 from __future__ import annotations
 
+import hashlib
+import json
+from datetime import datetime, timezone
+from urllib.parse import quote
+
 import re
 import shutil
 import subprocess
@@ -11,7 +16,7 @@ from typing import Any
 
 import httpx
 
-from ..models import PRContent, PRInfo
+from ..models import PRContent, PRInfo, PRCapture
 
 API = "https://api.github.com"
 _URL_RE = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
@@ -72,30 +77,53 @@ class GitHubProvider:
         return h
 
     async def fetch(self, repo: str, number: int) -> PRContent:
+        # Both diff endpoints use immutable commit IDs. A second metadata read
+        # catches requirement/title changes as well as pushes during capture.
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            meta_r = await client.get(f"{API}/repos/{repo}/pulls/{number}", headers=self._headers())
-            meta_r.raise_for_status()
-            meta = meta_r.json()
-            diff_r = await client.get(
-                f"{API}/repos/{repo}/pulls/{number}",
-                headers=self._headers("application/vnd.github.diff"),
-            )
-            diff_r.raise_for_status()
-        return PRContent(
-            provider=self.name,
-            repo=repo,
-            number=number,
-            url=meta.get("html_url", ""),
-            title=meta.get("title", ""),
-            description=meta.get("body") or "",
-            author=(meta.get("user") or {}).get("login", ""),
-            branch=(meta.get("head") or {}).get("ref", ""),
-            base_branch=(meta.get("base") or {}).get("ref", ""),
-            updated_at=meta.get("updated_at", ""),
-            additions=meta.get("additions", 0),
-            deletions=meta.get("deletions", 0),
-            diff=diff_r.text,
-        )
+            for _attempt in range(2):
+                url = f"{API}/repos/{repo}/pulls/{number}"
+                first = await client.get(url, headers=self._headers())
+                first.raise_for_status()
+                meta = first.json()
+                base, head = meta["base"]["sha"], meta["head"]["sha"]
+                if not all(re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", oid) for oid in (base, head)):
+                    raise ValueError("PR metadata lacks immutable revisions")
+                comparison = await client.get(f"{API}/repos/{repo}/compare/{base}...{head}", headers=self._headers())
+                comparison.raise_for_status()
+                merge_base = comparison.json()["merge_base_commit"]["sha"]
+                if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", merge_base):
+                    raise ValueError("Comparison lacks immutable merge base")
+                diff = await client.get(f"{API}/repos/{repo}/compare/{merge_base}...{head}", headers=self._headers("application/vnd.github.diff"))
+                diff.raise_for_status()
+                if len(diff.content) > 16 * 1024 * 1024:
+                    raise ValueError("Captured diff exceeds 16 MiB")
+                second = await client.get(url, headers=self._headers())
+                second.raise_for_status()
+                after = second.json()
+                info = self._pr_info(repo, meta)
+                identity = {"info": info.model_dump(), "base": base, "head": head}
+                next_identity = {"info": self._pr_info(repo, after).model_dump(), "base": after["base"]["sha"], "head": after["head"]["sha"]}
+                if identity != next_identity:
+                    continue
+                capture = PRCapture(provider=self.name, repository=repo, number=number, base_oid=base, head_oid=head, merge_base_oid=merge_base,
+                    diff_sha256=hashlib.sha256(diff.content).hexdigest(), diff_bytes=len(diff.content),
+                    metadata_sha256=hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                    captured_at=datetime.now(timezone.utc).isoformat(),
+                    limitations=["Provider diff coverage may omit binary/oversized changes; reference validity does not establish completeness."])
+                return PRContent(**info.model_dump(), diff=diff.content.decode("utf-8"), capture=capture)
+        raise ValueError("PR metadata changed during immutable capture; rerun the review")
+
+    async def fetch_file(self, repo: str, revision: str, path: str) -> str | None:
+        if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", revision) or re.match(r"^[A-Za-z]:", path) or "\0" in path or path.startswith("/") or "\\" in path or any(p in ("", ".", "..") for p in path.split("/")):
+            raise ValueError("Expected immutable revision and relative file path")
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            response = await client.get(f"{API}/repos/{repo}/contents/{quote(path, safe='/')}", params={"ref": revision}, headers=self._headers("application/vnd.github.raw+json"))
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            if len(response.content) > 1024 * 1024 or b"\0" in response.content:
+                raise ValueError("Evidence requires UTF-8 text up to 1 MiB")
+            return response.content.decode("utf-8")
 
     def _pr_info(self, repo: str, pr: dict) -> PRInfo:
         return PRInfo(
@@ -181,23 +209,19 @@ class GitHubProvider:
 
     async def fetch_comments(self, repo: str, number: int, limit: int = 30) -> list[dict[str, str]]:
         """PR discussion (issue comments + review comments) — extra requirement
-        context for EXTRACT. Read-only; failures degrade to no discussion."""
+        context for EXTRACT. Read-only; failures must reach the capture limitation."""
         out: list[dict[str, str]] = []
         async with httpx.AsyncClient(timeout=30) as client:
             for path in (f"issues/{number}/comments", f"pulls/{number}/comments"):
-                try:
-                    r = await client.get(
-                        f"{API}/repos/{repo}/{path}",
-                        params={"per_page": limit}, headers=self._headers(),
-                    )
-                    if r.status_code != 200:
-                        continue
-                    for c in r.json():
-                        body = (c.get("body") or "").strip()
-                        if body:
-                            out.append({"author": (c.get("user") or {}).get("login", ""), "body": body[:2000]})
-                except httpx.HTTPError:
-                    continue
+                r = await client.get(
+                    f"{API}/repos/{repo}/{path}",
+                    params={"per_page": limit}, headers=self._headers(),
+                )
+                r.raise_for_status()
+                for c in r.json():
+                    body = (c.get("body") or "").strip()
+                    if body:
+                        out.append({"author": (c.get("user") or {}).get("login", ""), "body": body[:2000]})
         return out[:limit]
 
     async def publish_review(
