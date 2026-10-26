@@ -823,6 +823,29 @@ async def add_requirement(rid: str, body: AddRequirementRequest) -> dict[str, An
     return {"job_id": job_id, "review_id": rid}
 
 
+@app.get("/api/reviews/{rid:path}/export/bygone/v2")
+async def export_bygone(rid: str) -> Any:
+    import httpx
+    from .bygone_export import build_bygone_v2
+
+    review = config.load_review(rid)
+    if review is None:
+        raise HTTPException(404, "no stored review")
+    if review.capture is None:
+        raise HTTPException(409, "Immutable capture unavailable; rerun with an evidence-capable provider")
+    provider = build_providers(config.load_config()).get(review.pr.provider)
+    fetch_file = getattr(provider, "fetch_file", None)
+    if fetch_file is None:
+        raise HTTPException(409, "Provider does not support immutable evidence export")
+    try:
+        payload = await build_bygone_v2(review, fetch_file)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    except httpx.HTTPError as error:
+        raise HTTPException(502, "Immutable source fetch failed; check provider access and retry") from error
+    return JSONResponse(payload, headers={"Cache-Control": "no-store", "Content-Disposition": 'attachment; filename="review.bygone-evidence.json"'})
+
+
 @app.get("/api/reviews/{rid:path}/data")
 async def get_review(rid: str) -> Any:
     review = config.load_review(rid)

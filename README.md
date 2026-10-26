@@ -71,3 +71,38 @@ to include findings by default.
 ```bash
 uv run pytest
 ```
+
+## Bygone evidence export
+
+For newly captured GitHub reviews, **Export Bygone evidence** downloads a pinned
+version 2 evidence artifact. The read-only endpoint is
+`GET /api/reviews/{review-id}/export/bygone/v2`. Import it in a local checkout with
+`bygone evidence import exported.json --output review.json`, then use VS Code's
+**Bygone: Open Evidence Review**. Git objects for the captured comparison must be
+available locally.
+
+Capture records the immutable base tip, merge base, head, diff digest, metadata
+digest, and time before analysis. A metadata race retries once and then fails.
+Exports retain saved source quotations and fetch code only at the captured head;
+they never reinterpret an old review against today's branch. Invalid anchors
+remain explicit limitations, and incomplete quotation provenance blocks export.
+The export does not transfer checklist state, discussion, approval, publication,
+or test execution claims. These remain owned by their existing systems.
+
+Legacy reviews and Bitbucket reviews without immutable capture remain readable,
+but cannot be exported as pinned evidence. GitHub API coverage and source-size
+limits are disclosed; a valid link does not establish completeness or fulfillment.
+
+To validate the cross-tool export/import contract against a compiled Bygone checkout:
+
+```sh
+BYGONE_CHECKOUT=/path/to/bygone uv run pytest -q tests/test_bygone_export.py
+```
+
+The fixture uses local Git commits and mocked provider data, including CRLF and
+non-ASCII text. It checks export, import, source validation, and tour generation;
+it does not contact GitHub or run a model. The interoperability case is skipped
+when `BYGONE_CHECKOUT` is absent. Export rejects divergent captured repository
+identity and oversized artifacts; unavailable individual source files are
+reported as limitations. Transport/authentication failures return a retryable
+provider error instead of a successful artifact.

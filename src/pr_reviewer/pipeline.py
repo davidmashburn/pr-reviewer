@@ -677,7 +677,7 @@ async def map_new_requirement(
 ) -> Review:
     """Map a single reviewer-written requirement against the stored diff and
     append it (plus its evidence link) to the review."""
-    req = Requirement(id=_next_req_id(review), text=text.strip(), source="reviewer")
+    req = Requirement(id=_next_req_id(review), text=text.strip(), source="reviewer", quote=text.strip())
     req_block = f"{req.id}: {req.text}  [source: reviewer]"
     base_note = "\nOnly map the single requirement above; leave `unexplained` and `net_effect` empty."
 
@@ -704,6 +704,11 @@ async def map_new_requirement(
     links, _, _ = validate_mapping(merged, review.hunks, [req])
     link = _finalize(links, [req])[0]
 
+    reviewer_source = next((s for s in review.sources if s.tag == "reviewer"), None)
+    if reviewer_source is None:
+        review.sources.append(SourceText(tag="reviewer", title="Reviewer requirements", text=req.text))
+    else:
+        reviewer_source.text += "\n\n" + req.text
     review.requirements.append(req)
     review.links.append(link)
     save_review(review)
@@ -782,6 +787,10 @@ async def run_review(
     progress("fetch", f"Fetching {provider.name}:{repo} #{number}")
     pr: PRContent = await provider.fetch(repo, number)
     stack_bases = parse_stack_bases(pr.description)
+    if pr.capture is not None:
+        import hashlib
+        if hashlib.sha256(pr.diff.encode("utf-8")).hexdigest() != pr.capture.diff_sha256:
+            raise ValueError("Captured diff does not match analysis input")
 
     # PARSE
     progress("parse", "Parsing diff into hunks")
@@ -805,11 +814,18 @@ async def run_review(
     discussion_text = ""
     fetch_comments = getattr(provider, "fetch_comments", None)
     if fetch_comments is not None:
+        if pr.capture is not None:
+            pr.capture.limitations.append("PR discussion context is bounded by the provider and may omit older/overflow comments or truncate bodies; it is not an immutable discussion snapshot.")
         try:
             comments = await fetch_comments(repo, number)
             discussion_text = "\n".join(f"@{c['author']}: {c['body']}" for c in comments).strip()
+            if len(discussion_text) > 8000 and pr.capture is not None:
+                pr.capture.limitations.append("PR discussion was truncated to 8000 characters before extraction and source retention.")
+            discussion_text = discussion_text[:8000]
         except Exception:
             discussion_text = ""
+            if pr.capture is not None:
+                pr.capture.limitations.append("PR discussion was unavailable during analysis; discussion requirements may be missing.")
 
     # EXTRACT (LLM #1)
     requirements: list[Requirement] = []
@@ -822,7 +838,7 @@ async def run_review(
             f"\nTicket {t.source}:{t.key} — {t.title}\n{t.body or '(no body)'}\n" for t in tickets
         )
         if discussion_text:
-            tickets_block += f"\nPR discussion (comments):\n{discussion_text[:8000]}\n"
+            tickets_block += f"\nPR discussion (comments):\n{discussion_text}\n"
         raw = await backend.structured(
             _instr + EXTRACT_PROMPT.format(
                 sources_block="Allowed source tags: " + ", ".join(source_tags),
@@ -846,8 +862,9 @@ async def run_review(
             if src not in source_tags:
                 src = "pr-description"
             quote = (r.get("quote") or "").strip()
-            if quote and quote.lower() not in source_texts.get(src, "").lower():
-                quote = ""  # provenance check failed — don't underline a phantom phrase
+            if quote:
+                match = re.search(re.escape(quote), source_texts.get(src, ""), re.IGNORECASE)
+                quote = match.group(0) if match else ""  # persist the actual source spelling
             requirements.append(Requirement(id=f"R{i}", text=r.get("text", "").strip(), source=src, quote=quote))
 
     mode = "requirements" if requirements else "explain"
@@ -925,9 +942,9 @@ async def run_review(
     if pr.description.strip():
         sources.append(SourceText(tag="pr-description", title="PR description", text=pr.description.strip()))
     for t in tickets:
-        sources.append(SourceText(tag=f"{t.source}:{t.key}", title=f"{t.key} — {t.title}", text=(t.body or "").strip()))
+        sources.append(SourceText(tag=f"{t.source}:{t.key}", title=f"{t.key} — {t.title}", text=f"{t.title}\n{t.body or ''}".strip()))
     if discussion_text:
-        sources.append(SourceText(tag="pr-discussion", title="PR discussion", text=discussion_text[:8000]))
+        sources.append(SourceText(tag="pr-discussion", title="PR discussion", text=discussion_text))
 
     raw_net = raw_map.get("net_effect", [])
     if len(raw_net) > 6:
@@ -940,6 +957,7 @@ async def run_review(
     review = Review(
         id=review_id(provider.name, repo, number),
         pr=pr.model_copy(update={"diff": ""}),  # PRInfo view; diff lives in files/hunks
+        capture=pr.capture,
         mode=mode,
         requirements=requirements,
         sources=sources,
