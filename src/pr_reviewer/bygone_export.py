@@ -245,6 +245,17 @@ async def build_bygone_v2(review: Review, fetch_file: Callable[[str, str, str], 
                     # Validate before provider access, including drive and traversal paths.
                     source_ref('x', capture.head_oid, anchor.file, 1, 1)
                     cache[anchor.file] = await fetch_file(capture.repository, capture.head_oid, anchor.file)
+                    # Bygone loads both snapshots for every linked path, even
+                    # when the evidence span refers only to the head. An absent
+                    # base (new file) and an empty base are both supported.
+                    if cache[anchor.file] is not None:
+                        try:
+                            base_text = await fetch_file(capture.repository, capture.merge_base_oid, anchor.file)
+                            if base_text:
+                                source_ref(base_text, capture.merge_base_oid, anchor.file, 1, 1)
+                            total_bytes += len((base_text or '').encode('utf-8'))
+                        except ValueError as error:
+                            raise ValueError(f'captured base: {error}') from error
                 except ValueError as error:
                     cache[anchor.file] = None
                     invalid[anchor.file] = str(error)

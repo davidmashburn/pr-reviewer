@@ -106,3 +106,10 @@ when `BYGONE_CHECKOUT` is absent. Export rejects divergent captured repository
 identity and oversized artifacts; unavailable individual source files are
 reported as limitations. Transport/authentication failures return a retryable
 provider error instead of a successful artifact.
+
+GitHub evidence reads mode-checked Git blobs rather than dereferencing symlinks.
+Both the captured merge-base and head must support a linked path in Bygone:
+non-regular, binary, non-UTF-8, or oversized files at either revision omit that
+path with an explicit limitation, while other valid links remain importable.
+An absent or empty base is supported. Checking both snapshots requires additional
+GitHub reads; transport/authentication failures still fail the export for retry.

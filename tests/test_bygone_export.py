@@ -1,4 +1,5 @@
 import hashlib
+from enum import Enum, auto
 
 import httpx
 import pytest
@@ -32,7 +33,7 @@ async def test_export_keeps_provenance_and_ignores_checklist():
     assert payload['decisions'] == [] and payload['runs'] == []
     assert payload['links'][0]['ref']['start'] == 7
     assert payload['links'][0]['ref']['digest'] == hashlib.sha256('export const a = 2;\r\n'.encode()).hexdigest()
-    assert captured == [('example/repo', HEAD, 'a.ts')]
+    assert captured == [('example/repo', HEAD, 'a.ts'), ('example/repo', MERGE, 'a.ts')]
     assert payload['analyses'][0]['status'] == 'partial'
 
 
@@ -245,7 +246,7 @@ async def test_export_import_interoperability(tmp_path):
     value.capture.base_oid = value.capture.merge_base_oid = base
     value.capture.head_oid = head
     async def fetch(repo, revision, path):
-        assert revision == head
+        assert revision in (base, head)
         return subprocess.check_output(['git', '-C', str(tmp_path), 'show', f'{revision}:{path}']).decode()
     payload = await build_bygone_v2(value, fetch)
     artifact = tmp_path / 'export.json'
@@ -258,6 +259,121 @@ async def test_export_import_interoperability(tmp_path):
     tour = tmp_path / 'evidence.bygone'
     subprocess.run(['node', cli, '-C', str(tmp_path), 'evidence', 'tour', str(imported), '--output', str(tour)], check=True, capture_output=True)
     assert json.loads(tour.read_text())['range'] == {'base': base, 'head': head}
+
+
+class EvidenceCase(Enum):
+    REGULAR = auto()
+    EXECUTABLE = auto()
+    ADDED = auto()
+    EMPTY_BASE = auto()
+    SYMLINK_HEAD = auto()
+    SYMLINK_BASE = auto()
+    BINARY_BASE = auto()
+    NON_UTF8_BASE = auto()
+    OVERSIZED_BASE = auto()
+
+
+@pytest.mark.parametrize('case', list(EvidenceCase))
+async def test_github_snapshot_contract_imports_remaining_evidence(tmp_path, monkeypatch, case):
+    import json
+    import os
+    import subprocess
+    from pathlib import Path
+    checkout = os.environ.get('BYGONE_CHECKOUT')
+    if not checkout:
+        pytest.skip('Set BYGONE_CHECKOUT to a compiled Bygone checkout for cross-tool validation')
+
+    def raw_git(*args):
+        return subprocess.check_output(['git', '-C', str(tmp_path), *args])
+
+    def git(*args):
+        return raw_git(*args).decode().strip()
+
+    git('init', '-q')
+    git('config', 'user.name', 'Fixture')
+    git('config', 'user.email', 'fixture@example.invalid')
+    source = tmp_path / 'nested' / 'a.ts'
+    source.parent.mkdir()
+    (tmp_path / 'good.ts').write_text('old\n')
+    if case is EvidenceCase.SYMLINK_BASE:
+        source.symlink_to('../good.ts')
+    elif case is not EvidenceCase.ADDED:
+        before = {
+            EvidenceCase.BINARY_BASE: b'old\0binary\n',
+            EvidenceCase.NON_UTF8_BASE: b'\xff\n',
+            EvidenceCase.OVERSIZED_BASE: b'x' * (1024 * 1024 + 1),
+            EvidenceCase.EMPTY_BASE: b'',
+        }.get(case, b'old\n')
+        source.write_bytes(before)
+    git('add', '.')
+    git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'test: base fixture')
+    base = git('rev-parse', 'HEAD')
+    if source.exists() or source.is_symlink():
+        source.unlink()
+    if case is EvidenceCase.SYMLINK_HEAD:
+        source.symlink_to('../good.ts')
+    else:
+        source.write_bytes('// 😀\r\nexport const a = 2;\r\n'.encode())
+        if case is EvidenceCase.EXECUTABLE:
+            source.chmod(0o755)
+    (tmp_path / 'good.ts').write_text('new\n')
+    git('add', '.')
+    git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'test: head fixture')
+    head = git('rev-parse', 'HEAD')
+
+    # Mock the GitHub wire boundary using actual local Git objects. No Contents
+    # response can mask a symlink by returning the target's bytes.
+    def handler(request):
+        resource, oid = request.url.path.rsplit('/git/', 1)[1].split('/')
+        if resource == 'commits':
+            assert oid in (base, head)
+            return httpx.Response(200, json={'tree': {'sha': git('rev-parse', f'{oid}^{{tree}}')}})
+        if resource == 'trees':
+            assert not request.url.params  # non-recursive, including nested paths
+            entries = []
+            for row in raw_git('ls-tree', '-z', oid).split(b'\0'):
+                if row:
+                    metadata, path = row.decode().split('\t', 1)
+                    mode, kind, sha = metadata.split()
+                    entries.append({'path': path, 'mode': mode, 'type': kind, 'sha': sha})
+            return httpx.Response(200, json={'tree': entries, 'truncated': False})
+        assert resource == 'blobs'
+        assert request.headers['accept'] == 'application/vnd.github.raw+json'
+        return httpx.Response(200, content=raw_git('cat-file', 'blob', oid))
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr('pr_reviewer.providers.github.httpx.AsyncClient', lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs))
+    value = review()
+    value.capture.base_oid = value.capture.merge_base_oid = base
+    value.capture.head_oid = head
+    value.links[0].anchors = [Anchor(file='nested/a.ts', start=2, end=2), Anchor(file='good.ts', start=1, end=1)]
+    payload = await build_bygone_v2(value, GitHubProvider().fetch_file)
+    supported = case in (EvidenceCase.REGULAR, EvidenceCase.EXECUTABLE, EvidenceCase.ADDED, EvidenceCase.EMPTY_BASE)
+    assert [link['ref']['path'] for link in payload['links']] == (['nested/a.ts', 'good.ts'] if supported else ['good.ts'])
+    if not supported:
+        limitations = '\n'.join(payload['analyses'][0]['limitations'])
+        assert 'nested/a.ts' in limitations
+        if case is EvidenceCase.SYMLINK_HEAD:
+            assert 'not a regular file' in limitations
+        else:
+            assert 'captured base:' in limitations
+    artifact = tmp_path / 'export.json'
+    artifact.write_text(json.dumps(payload))
+    imported = tmp_path / 'imported.json'
+    cli = str(Path(checkout) / 'bin/bygone.js')
+    result = subprocess.run(['node', cli, '-C', str(tmp_path), 'evidence', 'import', str(artifact), '--output', str(imported)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    inspected = json.loads(subprocess.check_output(['node', cli, '-C', str(tmp_path), 'evidence', 'inspect', str(imported)], text=True))
+    assert all(link['resolution']['status'] == 'valid' for link in inspected['report']['requirements'][0]['links'])
+
+
+async def test_base_transport_failure_is_not_downgraded_to_a_limitation():
+    async def fetch(repo, revision, path):
+        if revision == MERGE:
+            raise httpx.ConnectError('base unavailable')
+        return '// header\nreturn 2;\n'
+    with pytest.raises(httpx.ConnectError, match='base unavailable'):
+        await build_bygone_v2(review(), fetch)
 
 
 async def test_export_preserves_unexplained_changes_and_overflow_as_limitations():

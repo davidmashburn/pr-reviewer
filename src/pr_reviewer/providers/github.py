@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from urllib.parse import quote
+from enum import StrEnum
 
 import re
 import shutil
@@ -24,6 +24,14 @@ _URL_RE = re.compile(r"github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
 _gh_cache: tuple[float, str] = (0.0, "")
 _GH_TTL_S = 300
 _user_cache: tuple[float, str, str] = (0.0, "", "")  # (ts, token, login)
+
+
+class GitFileMode(StrEnum):
+    REGULAR = "100644"
+    EXECUTABLE = "100755"
+    DIRECTORY = "040000"
+    SYMLINK = "120000"
+    SUBMODULE = "160000"
 
 
 def _set_user_cache(ts: float, token: str, login: str) -> None:
@@ -117,9 +125,29 @@ class GitHubProvider:
         if not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", revision) or re.match(r"^[A-Za-z]:", path) or "\0" in path or path.startswith("/") or "\\" in path or any(p in ("", ".", "..") for p in path.split("/")):
             raise ValueError("Expected immutable revision and relative file path")
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            response = await client.get(f"{API}/repos/{repo}/contents/{quote(path, safe='/')}", params={"ref": revision}, headers=self._headers("application/vnd.github.raw+json"))
-            if response.status_code == 404:
-                return None
+            # Contents/raw can dereference symlinks. Walk the captured Git tree
+            # instead, then read only the blob belonging to a regular file.
+            response = await client.get(f"{API}/repos/{repo}/git/commits/{revision}", headers=self._headers())
+            response.raise_for_status()
+            tree = response.json()["tree"]["sha"]
+            parts = path.split("/")
+            for index, part in enumerate(parts):
+                response = await client.get(f"{API}/repos/{repo}/git/trees/{tree}", headers=self._headers())
+                response.raise_for_status()
+                data = response.json()
+                if data.get("truncated"):
+                    raise ValueError("Evidence tree listing is truncated")
+                entry = next((item for item in data["tree"] if item["path"] == part), None)
+                if entry is None:
+                    return None
+                mode = GitFileMode(entry["mode"])
+                if index < len(parts) - 1:
+                    if mode is not GitFileMode.DIRECTORY:
+                        raise ValueError("Evidence parent is not a directory")
+                    tree = entry["sha"]
+                elif mode not in (GitFileMode.REGULAR, GitFileMode.EXECUTABLE):
+                    raise ValueError("Evidence is not a regular file")
+            response = await client.get(f"{API}/repos/{repo}/git/blobs/{entry['sha']}", headers=self._headers("application/vnd.github.raw+json"))
             response.raise_for_status()
             if len(response.content) > 1024 * 1024 or b"\0" in response.content:
                 raise ValueError("Evidence requires UTF-8 text up to 1 MiB")
